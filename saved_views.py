@@ -2,6 +2,7 @@
 import json
 import os
 import sqlite3
+import cloud_accounts
 from datetime import date, datetime
 from pathlib import Path
 
@@ -24,7 +25,8 @@ def connect():
     return db
 def restore(state):
     if os.environ.get("ORLANDO_PUBLIC_MODE", "0") == "1":
-        return  # No shared saved preferences between visitors.
+        cloud_accounts.load(state,allowed,deserialize)
+        return
     try:
         with connect() as db:
             for key,value in db.execute('SELECT key,value FROM params'):
@@ -34,7 +36,8 @@ def restore(state):
     except sqlite3.Error: pass
 def save(state):
     if os.environ.get("ORLANDO_PUBLIC_MODE", "0") == "1":
-        return  # Streamlit session_state already retains parameters within a session.
+        cloud_accounts.save(state,allowed,serialize)
+        return
     rows=[]
     for key in list(state):
         if allowed(key):
@@ -47,6 +50,7 @@ def save(state):
         except sqlite3.Error: pass
 def clear(state):
     if os.environ.get("ORLANDO_PUBLIC_MODE", "0") == "1":
+        cloud_accounts.clear(state,allowed)
         for key in list(state):
             if allowed(key): del state[key]
         return
