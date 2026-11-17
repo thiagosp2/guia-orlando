@@ -10,6 +10,7 @@ from datetime import date
 from pathlib import Path
 
 import requests
+import cloud_history
 
 CACHE_DB = Path(__file__).parent / "planner_history_cache.sqlite3"
 
@@ -68,9 +69,18 @@ def collect_history(parks, days, request_one, db=CACHE_DB, max_workers=3,
     if not 1 <= max_workers <= 6:
         raise ValueError('max_workers must be between 1 and 6')
     days=list(days)
-    by_park={}; tasks=[]; cache_hits=0
+    by_park={}; tasks=[]; cache_hits=0; cloud_hits=0; cloud_errors=[]
     for park_id in parks:
         cached=read_cached(park_id,days,db=db)
+        missing=[d for d in days if d not in cached]
+        if missing and cloud_history.enabled():
+            try:
+                remote=cloud_history.read(park_id,missing)
+                cached.update(remote)
+                cloud_hits+=len(remote)
+                write_cached(park_id,remote,db=db)
+            except (requests.RequestException,ValueError,KeyError,TypeError) as exc:
+                cloud_errors.append(f'{park_id}: {str(exc)[:140]}')
         by_park[park_id]=cached
         cache_hits+=len(cached)
         tasks.extend((park_id,d) for d in days if d not in cached)
@@ -107,5 +117,10 @@ def collect_history(parks, days, request_one, db=CACHE_DB, max_workers=3,
     persisted=sum(len(x) for x in new_payloads.values())
     for park_id,payloads in new_payloads.items():
         write_cached(park_id,payloads,db=db)
+        if payloads and cloud_history.enabled():
+            try: cloud_history.write(park_id,payloads)
+            except (requests.RequestException,ValueError,KeyError,TypeError) as exc:
+                cloud_errors.append(f'{park_id}: {str(exc)[:140]}')
     return by_park,failures,{'cache_hits':cache_hits,'api_requests':total,
-        'successful_requests':persisted,'failed_requests':len(failures)}
+        'successful_requests':persisted,'failed_requests':len(failures),
+        'cloud_hits':cloud_hits,'cloud_errors':cloud_errors}

@@ -26,6 +26,7 @@ from free_history import download_wdw_history, download_touringplans, park_day_d
 from crowd_model import park_days, forecast_park, attraction_estimates
 from period_history import period_waits, summarize_period, WEEKDAYS_PT
 from opportunity import build_baselines, rank_opportunities
+from live_history import historical_opportunity_samples
 from day_optimizer import WEEKDAYS, day_metric, weekday_baselines, recommend_dates, recommend_date_options
 from decision_engine import collect_day_metrics, weekday_summary, ordered_weekdays
 import requests
@@ -45,6 +46,9 @@ API='https://api.themeparks.wiki/v1'
 LIGHT_MAP_STYLE='https://basemaps.cartocdn.com/gl/positron-gl-style/style.json'
 DB=Path(__file__).parent/'wait_history.sqlite3'
 st.set_page_config(page_title='Guia Orlando — Disney + Universal',page_icon='🎢',layout='wide')
+import cloud_accounts
+if os.environ.get('ORLANDO_PUBLIC_MODE', '0') == '1':
+    cloud_accounts.gate(st.session_state)
 restore_params(st.session_state)
 # On public hosting, saved selections are per-session only, never shared globally.
 
@@ -96,12 +100,12 @@ def load_free_holiday_history():
 
 
 def active_api_key():
-    """Use the key entered in the UI, or the environment variable as fallback."""
+    """Server-managed key. Never ask visitors to enter an API credential."""
     try:
         secret = st.secrets.get('THEMEPARKS_API_KEY', '')
     except (FileNotFoundError, KeyError):
         secret = ''
-    return (st.session_state.get('api_key_input') or os.getenv('THEMEPARKS_API_KEY', '') or secret).strip()
+    return str(secret or os.getenv('THEMEPARKS_API_KEY', '')).strip()
 
 
 def auth_cache_token():
@@ -360,14 +364,8 @@ with st.sidebar:
         clear_params(st.session_state)
         st.rerun()
     st.caption('Site público: filtros mantidos apenas nesta sessão. Nenhum resultado ou chave de API é salvo como preferência.')
-    st.subheader('Chave da API (opcional)')
-    st.text_input('ThemeParks.wiki API Key', type='password', key='api_key_input',
-                  help='Cole sua chave gratuita. Ela fica apenas na sessão atual e não aparece na tela.')
-    if active_api_key():
-        st.success('Chave configurada para as consultas. O acesso ao histórico depende da validade e do plano.')
-    else:
-        st.info('Sem chave: o histórico gratuito é mais limitado.')
-    st.caption('No Streamlit Cloud, configure THEMEPARKS_API_KEY em App settings → Secrets; localmente, use variável de ambiente.')
+    if not active_api_key():
+        st.warning('Chave de histórico não configurada no servidor. Configure THEMEPARKS_API_KEY nos Secrets do Streamlit Cloud.')
     st.subheader('Caminhadas')
     valhalla_url=st.text_input('URL do servidor Valhalla (opcional)', value=os.getenv('VALHALLA_URL',routing.PUBLIC_VALHALLA),
          help='Padrão: servidor público de demonstração, sujeito a limites e indisponibilidade. Pode informar outro servidor.')
@@ -394,7 +392,8 @@ PARKS.update(universal_parks)
 # containing both operators, then use its result consistently throughout the app.
 if st.session_state.get('park_all') not in PARKS:
     st.session_state.pop('park_all',None)
-park=st.sidebar.selectbox('Selecionar parque (Disney + Universal)',list(PARKS),key='park_all',on_change=save_params,args=(st.session_state,))
+# Selection lives inside "Meu dia no parque", not in the global sidebar.
+park = st.session_state.get('park_all') if st.session_state.get('park_all') in PARKS else next(iter(PARKS))
 pid=PARKS[park]
 regular_only=st.sidebar.checkbox('Considerar apenas o horário regular dos parques',value=True,key='regular_only',help='Desmarque para incluir horários EXTRA_HOURS publicados. After Hours com ingresso separado pode não constar no calendário e não é incluído automaticamente.')
 area_plan,area_day,area_explore,area_settings=st.tabs([
@@ -402,6 +401,8 @@ area_plan,area_day,area_explore,area_settings=st.tabs([
 with area_plan:
     tab_mobile=st.container()
 with area_day:
+    st.selectbox('🎢 Parque para acompanhar', list(PARKS), key='park_all',
+                 on_change=save_params, args=(st.session_state,))
     tab_live,tab_route=st.tabs(['🎯 Filas e oportunidades','🗺️ Roteiro e mapa'])
 with area_explore:
     tab_analytics,tab_days=st.tabs([
@@ -511,15 +512,42 @@ if not df.empty:
             return round(result['distance_m']/1000/walking_speed*60,1) if result else None
         rank=rank_rides(df,current,priorities,done,max_wait,trends,walk_lookup=walking_lookup,must_ids=must,allow_must_over_limit=allow_must_over_limit)
         # Oportunidade é relativa ao histórico real da mesma atração, sem usar pico como média.
-        baselines=build_baselines(historical_observations(park,days=30))
+        # Historical queue metrics use remote park-day data, not only local live polls.
+        # This works for every park with historical coverage, including Universal.
+        history_key=f'opportunity_remote_{pid}'
+        if history_key not in st.session_state:
+            with st.spinner(f'Consultando histórico real de {park} (até 30 dias)...'):
+                key_for_workers=active_api_key()
+                def request_opportunity_history(park_id, day):
+                    with requests.Session() as session:
+                        session.mount('https://', WindowsTrustAdapter())
+                        if key_for_workers:
+                            session.headers['X-API-Key']=key_for_workers
+                        response=session.get(f'{API}/entity/{park_id}/history',
+                                             params={'date':day.isoformat()},timeout=35)
+                        response.raise_for_status()
+                        return response.json()
+                samples, history_errors, coverage=historical_opportunity_samples(
+                    pid,request_opportunity_history,days=30)
+                st.session_state[history_key]=(samples,history_errors,coverage)
+        samples,history_errors,coverage=st.session_state[history_key]
+        baselines=build_baselines(samples or historical_observations(park,days=30))
         rank=rank_opportunities(rank,baselines)
+        st.caption(f"Histórico {park}: {coverage.get('park_days',0)} dias retornados · "
+                   f"{coverage.get('rides',0)} atrações com observações · "
+                   f"{coverage.get('failed_requests',0)} consultas falharam.")
+        if history_errors and not baselines:
+            st.warning('Histórico indisponível. Exemplo de erro: '+str(history_errors[0]))
+        if st.button('🔄 Reconsultar histórico deste parque',key=f'reload_history_{pid}'):
+            st.session_state.pop(history_key,None)
+            st.rerun()
         st.caption('Ordenação por oportunidade: favorece filas abaixo da média histórica da própria atração. '
                    'Com pelo menos 6 amostras em 2 dias, prioriza o mesmo horário (±90 min, Orlando); '
                    'sem cobertura nesse horário, usa o histórico geral e sinaliza essa limitação. '
                    'Imperdíveis, limite de fila e caminhada continuam respeitados.')
         if not baselines:
-            st.info('Ainda não há histórico local suficiente para detectar oportunidades. '
-                    'A ordem original é mantida até que o aplicativo acumule observações em dias diferentes.')
+            st.info('Ainda não há amostras históricas suficientes para detectar oportunidades. '
+                    'A ordem original é mantida até que a API forneça observações em dias diferentes.')
         # O aviso sobre imperdíveis excluídas é independente da tabela de elegíveis.
         excluded_must=df[df['id'].isin(must) & (df['Status']=='OPERATING') & df['Fila (min)'].notna() & (df['Fila (min)']>max_wait)]
         if not allow_must_over_limit and not excluded_must.empty:
