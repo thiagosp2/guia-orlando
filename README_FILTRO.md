@@ -1,0 +1,1 @@
+Correção: fila máxima é um limite rígido por padrão em recomendações e roteiro. Imperdíveis acima do limite são excluídas, com alerta. Uma caixa de seleção na barra lateral permite autorizar explicitamente a exceção.

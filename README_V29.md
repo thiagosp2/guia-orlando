@@ -1,0 +1,1 @@
+Versão 29: exportação de PDF implementada apenas com a biblioteca padrão Python, sem reportlab. Não é necessário instalar novas dependências para gerar PDF. Mantém a análise histórica remota ThemeParks.wiki e as funcionalidades da v28.

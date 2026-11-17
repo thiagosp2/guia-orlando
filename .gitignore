@@ -1,0 +1,10 @@
+*.sqlite3
+*.sqlite3-*
+*.db
+.map_tiles/
+__pycache__/
+*.py[cod]
+.env
+.streamlit/secrets.toml
+.venv/
+.pytest_cache/
