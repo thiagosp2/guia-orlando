@@ -21,7 +21,8 @@ class WindowsTrustAdapter(HTTPAdapter):
         kwargs["ssl_context"] = (truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT) if truststore else ssl.create_default_context())
         return super().init_poolmanager(connections, maxsize, block=block, **kwargs)
 
-DB = Path(__file__).parent / 'walking_routes.sqlite3'
+DB = Path(__file__).parent / 'walking_routes_v61.sqlite3'
+# Novo cache: descarta estimativas antigas calculadas em apenas um sentido.
 
 
 def init_db():
@@ -44,47 +45,66 @@ def cached(park, origin, destination, max_age_days=30):
 
 
 def fetch_route(base_url, park, origin, destination, start, finish, speed_kmh=4.0):
-    """Return actual pedestrian route only if a configured service returns valid coordinates.
-    Valhalla returns a route duration based on its own model; scale by distance/user speed.
+    """Compare os dois sentidos da malha de pedestres e escolha o menor trajeto válido.
+
+    Alguns caminhos do OSM nos parques possuem sentido único cadastrado
+    incorretamente. A rota inversa é invertida geometricamente para continuar
+    sendo exibida da origem solicitada ao destino solicitado.
     """
-    old=cached(park,origin,destination)
+    if speed_kmh <= 0:
+        raise ValueError('Velocidade de caminhada inválida')
+    old = cached(park, origin, destination)
     if old:
-        return {**old,'duration_min':round(old['distance_m']/1000/speed_kmh*60,1)}
+        return {**old, 'duration_min': round(old['distance_m']/1000/speed_kmh*60, 1)}
     if not base_url.strip():
         return None
-    url=base_url.rstrip('/')+'/route'
-    params={'locations':[{'lat':float(start[0]),'lon':float(start[1])},
-                          {'lat':float(finish[0]),'lon':float(finish[1])}],
-            'costing':'pedestrian','directions_options':{'units':'kilometers'}}
-    # Send Valhalla request as JSON POST body, avoiding URL JSON parsing issues.
-    # SSL uses the Windows trust store, including trusted corporate roots.
+
+    url = base_url.rstrip('/') + '/route'
+    candidates = []
+    errors = []
     with requests.Session() as session:
         session.mount('https://', WindowsTrustAdapter())
-        response=session.post(url, json=params, headers={'Accept':'application/json'}, timeout=25)
-        if not response.ok:
+        for first, last, reverse in ((start, finish, False), (finish, start, True)):
+            params = {
+                'locations': [{'lat': float(first[0]), 'lon': float(first[1])},
+                              {'lat': float(last[0]), 'lon': float(last[1])}],
+                'costing': 'pedestrian',
+                'directions_options': {'units': 'kilometers'},
+            }
             try:
-                detail = response.json()
-                message = detail.get('error') or detail.get('error_message') or detail.get('message') or str(detail)
-                code = detail.get('error_code', detail.get('status_code', ''))
-            except ValueError:
-                message = response.text[:350]
-                code = ''
-            raise ValueError(f"Valhalla HTTP {response.status_code} (código {code}): {str(message)[:400]}")
-        payload=response.json()
-    trip=payload['trip']
-    length_km=float(trip['summary']['length'])
-    if not 0 < length_km < 20: raise ValueError('Distância de rota inesperada')
-    legs=trip.get('legs') or []
-    shape=legs[0].get('shape') if legs else None
-    points=decode_polyline6(shape) if shape else []
-    if len(points)<2: raise ValueError('Rota sem geometria válida')
-    distance=length_km*1000
-    duration=round(length_km/speed_kmh*60,1)
+                response = session.post(url, json=params,
+                                        headers={'Accept': 'application/json'}, timeout=25)
+                response.raise_for_status()
+                trip = response.json()['trip']
+                length_km = float(trip['summary']['length'])
+                if not 0 < length_km < 20:
+                    raise ValueError('Distância de rota inesperada')
+                legs = trip.get('legs') or []
+                points = []
+                for leg in legs:
+                    if leg.get('shape'):
+                        segment = decode_polyline6(leg['shape'])
+                        points.extend(segment if not points else segment[1:])
+                if len(points) < 2:
+                    raise ValueError('Rota sem geometria válida')
+                if reverse:
+                    points.reverse()
+                candidates.append((length_km * 1000, points, reverse))
+            except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
+                errors.append(str(exc))
+
+    if not candidates:
+        raise ValueError('Nenhuma rota de pedestres válida nos dois sentidos: ' + '; '.join(errors)[:300])
+    distance, points, used_reverse = min(candidates, key=lambda item: item[0])
+    duration = round(distance/1000/speed_kmh*60, 1)
     init_db()
     with sqlite3.connect(DB) as con:
         con.execute('INSERT OR REPLACE INTO routes VALUES (?,?,?,?,?,?,?)',
-                    (park,str(origin),str(destination),distance,duration,json.dumps(points),int(time.time())))
-    return {'distance_m':distance,'duration_min':duration,'points':points,'source':'Valhalla (rota OSM)'}
+                    (park, str(origin), str(destination), distance, duration,
+                     json.dumps(points), int(time.time())))
+    return {'distance_m': distance, 'duration_min': duration, 'points': points,
+            'source': 'Valhalla (menor rota nos dois sentidos' +
+                      (', sentido inverso' if used_reverse else '') + ')'}
 
 
 def decode_polyline6(encoded):
